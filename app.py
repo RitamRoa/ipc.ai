@@ -25,7 +25,7 @@ def load_data():
 
 @st.cache_data(show_spinner=False)
 def get_cached_query_plan(query):
-    """Caches LLM responses to avoid hitting Gemini free tier rate limits (5 requests/minute)."""
+    """Caches LLM responses to avoid hitting provider free-tier rate limits."""
     return generate_query_plan(query)
 
 EVALUATION_TEST_CASES = [
@@ -49,8 +49,8 @@ EVALUATION_PLAN_CACHE = {
 PLANNER_FAILURE_INTENTS = {"rate_limited", "api_error", "invalid_json", "error"}
 
 
-def get_evaluation_plan(question, use_live_gemini):
-    if use_live_gemini:
+def get_evaluation_plan(question, use_live_groq):
+    if use_live_groq:
         return generate_query_plan(question)
     return EVALUATION_PLAN_CACHE.get(
         question,
@@ -91,15 +91,19 @@ with tab1:
     user_query = st.text_input("Ask a question:", placeholder="e.g., Which state has the highest number of murder incidents?")
 
     if st.button("Submit", type="primary"):
+        retry_after_epoch = st.session_state.get("planner_retry_after_epoch", 0)
         if not user_query.strip():
             st.warning("Please enter a question.")
         elif df.empty:
             st.error("Dataset not loaded. Cannot proceed.")
+        elif time.time() < retry_after_epoch:
+            wait_seconds = int(retry_after_epoch - time.time())
+            st.warning(f"Groq asked us to wait before retrying. Try again in about {wait_seconds} seconds.")
         else:
             start_time = time.time()
             
-            # Step 1: Gemini Query Planner (NL -> JSON)
-            with st.status("Analyzing question structure with Gemini...", expanded=True) as status:
+            # Step 1: Groq Query Planner (NL -> JSON)
+            with st.status("Analyzing question structure with Groq...", expanded=True) as status:
                 st.write("Generating structured JSON intent...")
                 plan_json = generate_query_plan(user_query)
                 
@@ -111,11 +115,21 @@ with tab1:
                 
             execution_time = round(time.time() - start_time, 2)
             
-            st.success(f"Response assembled in {execution_time} seconds.")
+            planner_failed = plan_json.get('intent') in PLANNER_FAILURE_INTENTS
+            if planner_failed:
+                retry_after_seconds = plan_json.get("retry_after_seconds")
+                if retry_after_seconds:
+                    st.session_state["planner_retry_after_epoch"] = time.time() + retry_after_seconds
+                st.error(f"Planner unavailable: {plan_json.get('intent')}")
+                st.warning(plan_json.get("message", "Groq could not generate a query plan right now."))
+            else:
+                st.success(f"Response assembled in {execution_time} seconds.")
             
             # --- UI Layout for Results ---
             
-            if plan_json.get('intent') == 'out_of_scope':
+            if planner_failed:
+                st.info("Try again later, use cached evaluation mode for tests, or switch to a paid/higher-quota Groq account.")
+            elif plan_json.get('intent') == 'out_of_scope':
                 st.warning("⚠️ " + result['answer'])
             else:
                 # 1. Answer
@@ -154,18 +168,18 @@ with tab1:
 with tab2:
     st.header("Evaluation")
     st.write("Here we evaluate standard test cases against the system architecture.")
-    st.info("Cached evaluation mode is used to conserve Gemini API quota. Manual queries continue to use the live Gemini planner.")
+    st.info("Cached evaluation mode is used to conserve Groq API quota. Manual queries continue to use the live Groq planner.")
 
     cached_validation = st.checkbox("Cached Validation (Recommended)", value=True)
-    use_live_gemini = st.checkbox("Live Gemini Validation", value=False)
+    use_live_groq = st.checkbox("Live Groq Validation", value=False)
 
-    if use_live_gemini:
-        st.warning("Live validation uses the Gemini API and may be affected by free-tier rate limits.")
-    if cached_validation and use_live_gemini:
-        st.caption("Live Gemini Validation is active for this run; cached plans are bypassed.")
-    validation_mode_selected = cached_validation or use_live_gemini
+    if use_live_groq:
+        st.warning("Live validation uses the Groq API and may be affected by free-tier rate limits.")
+    if cached_validation and use_live_groq:
+        st.caption("Live Groq Validation is active for this run; cached plans are bypassed.")
+    validation_mode_selected = cached_validation or use_live_groq
     if not validation_mode_selected:
-        st.warning("Select Cached Validation or Live Gemini Validation before running evaluations.")
+        st.warning("Select Cached Validation or Live Groq Validation before running evaluations.")
 
     if st.button("Run Evaluations", disabled=not validation_mode_selected):
         results_data = []
@@ -175,8 +189,12 @@ with tab2:
         for i, tc in enumerate(EVALUATION_TEST_CASES):
             my_bar.progress((i) / len(EVALUATION_TEST_CASES), text=f"Evaluating: '{tc['q']}'")
 
-            res_json = get_evaluation_plan(tc["q"], use_live_gemini)
+            res_json = get_evaluation_plan(tc["q"], use_live_groq)
             actual_intent = res_json.get("intent", "api_error")
+            if use_live_groq and actual_intent == "rate_limited":
+                retry_after_seconds = res_json.get("retry_after_seconds")
+                if retry_after_seconds:
+                    st.session_state["planner_retry_after_epoch"] = time.time() + retry_after_seconds
             execution_result = execute_plan(df, res_json) if not df.empty else {
                 "answer": "Dataset not loaded. Cannot execute evaluation.",
                 "data": None,
@@ -193,7 +211,11 @@ with tab2:
                 "Pass/Fail": "Pass" if passed else "Fail"
             })
 
-            time.sleep(2 if use_live_gemini else 0.2)
+            if use_live_groq and actual_intent == "rate_limited":
+                st.warning("Live evaluation stopped after Groq returned rate_limited. Cached Validation is safer for routine evaluation.")
+                break
+
+            time.sleep(2 if use_live_groq else 0.2)
 
         my_bar.progress(1.0, text="Evaluation complete!")
         results_df = pd.DataFrame(results_data)
