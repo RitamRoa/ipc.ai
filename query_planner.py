@@ -8,8 +8,26 @@ from prompts import SYSTEM_PROMPT
 
 load_dotenv()
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL_NAME = 'llama-3.3-70b-versatile'
+
+
+def get_groq_api_key():
+    api_key = os.environ.get("GROQ_API_KEY")
+    if api_key:
+        return api_key
+
+    try:
+        import streamlit as st
+        return st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        return None
+
+
+def get_groq_client():
+    api_key = get_groq_api_key()
+    if not api_key:
+        return None
+    return Groq(api_key=api_key)
 
 
 def extract_retry_delay_seconds(error_text: str):
@@ -50,6 +68,14 @@ def generate_query_plan(user_query: str, max_retries: int = 1) -> dict:
     """
     Takes a natural language query and returns a structured JSON intent using Groq.
     """
+    client = get_groq_client()
+    if client is None:
+        return {
+            "intent": "api_error",
+            "message": "Missing GROQ_API_KEY. Add it to Streamlit secrets before deploying.",
+            "model": MODEL_NAME,
+        }
+
     prompt = f"{SYSTEM_PROMPT}\n\nUser Question: {user_query}\nJSON:"
 
     for attempt in range(max_retries + 1):
